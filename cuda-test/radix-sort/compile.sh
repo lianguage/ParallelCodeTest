@@ -1,0 +1,1 @@
+nvcc -std=c++11 -g radix.cu -o radix
