@@ -4,7 +4,7 @@
 #include <cstdlib>
 #include <ctime>
 
-#define filesize 8888
+#define filesize 42424242
 
 using namespace std;
 

@@ -106,7 +106,7 @@ __global__ void scan_inplace_threads(
 	for( int s = 1 ; s < blockDim.x ; s <<= 1 ){
 		unsigned int val = 0;
 		int spot = tid - s;
-		if( spot >= 0){
+		if( spot >= 0 && index < numElems){
 	 		val = d_elements[spot+bos];
 		}
 		__syncthreads();
@@ -118,15 +118,14 @@ __global__ void scan_inplace_threads(
 }
 
 __global__ void scan_get_block_sum( 
-								unsigned int * const d_scanned_elements,
+								unsigned int * const d_scanned_elements,//expected to be an inclusive scan
 								unsigned int * const d_blocksums,
 								int numElems
 							 ){
 	int index = threadIdx.x + blockIdx.x * blockDim.x;
 	//if(index >= numElems ){ return; } //syncthreads not used, so early exit is not a problem
-	int bid = ((int)blockIdx.x -1 ) * (int)blockDim.x;
 	
-	if( (int)threadIdx.x == bid && index < numElems ){ 
+	if( threadIdx.x + 1 == blockDim.x && index < numElems || index+1 == numElems ){ 
 		d_blocksums[blockIdx.x] = d_scanned_elements[index];
 	}
 }
@@ -138,27 +137,36 @@ __global__ void scan_add_block_sum(
 										int numElems
 									 ){
 	int index = threadIdx.x + blockDim.x * blockIdx.x;
-	if( index >= numElems ){ return; }
-	if(blockIdx.x != 0){d_elements[index] += d_blocksums[blockIdx.x + 1]; }
+	//if( index >= numElems ){ return; }
+	//if(blockIdx.x != 0){d_elements[index] += d_blocksums[blockIdx.x + 1]; }
+	if( index < numElems && index >= blockDim.x ){
+		int local_blocksum = d_blocksums[blockIdx.x - 1];
+		d_elements[index] += local_blocksum;
+	} 
 
 }
 
 __global__ void scan_polishing( 
 										unsigned int * const d_elems,
+										unsigned int * const d_value_buffer,
 										unsigned int * const d_predicate,
 										unsigned int * const d_middle,
 										int numElems
 									  ){
 	int index = threadIdx.x + blockDim.x * blockIdx.x;
-	if( index >= numElems ){ return; }
 
 	//inclusive to exclusive
-	int temp = 0;
-	if( index != 0 ){temp = d_elems[index -1];}
-	d_elems[index] = temp;
+	if( index <numElems ){
+		int temp = 0;
+		if( index != 0 ){d_value_buffer[index] = d_elems[index -1];}
+		d_elems[index] = d_value_buffer[index];
+	}
+	syncthreads();
 
-	//adding 'identity' to all elements 
-	d_elems[index] += d_middle[0];
+	//adding 'identity' to all elements
+	int identity = d_middle[0];
+	d_elems[index] += identity;
+
 	if( index == numElems - 1 ){ 
 		d_middle[0] = d_elems[index];
 		d_middle[0] += d_predicate[index];
@@ -180,21 +188,25 @@ __global__ void radix_reposition(
 						     unsigned int* const d_position2,
                              unsigned int* const d_predicate,
                              unsigned int* const d_values,
+                             unsigned int* const d_value_buffer,
                              int size){
 
 	int index = threadIdx.x + blockDim.x * blockIdx.x;
-	if( index >= size ){ return; }
 	unsigned int displacement_index= 0;
-	if(d_predicate[index] == 1){
-		displacement_index = d_position2[index];
+	if( index < size ){
+		if(d_predicate[index] == 1){
+			displacement_index = d_position2[index];
+		}
+		else{
+			displacement_index = d_position1[index];
+		}
+		d_value_buffer[index] = d_values[index];
 	}
-	else{
-		displacement_index = d_position1[index];
-	}
-	unsigned int value = d_values[index];
 	syncthreads();
-	d_values[displacement_index] = value;
-
+	if(index < size ){
+		d_values[displacement_index] = d_value_buffer[index];
+	}
+	
 }
 
 
@@ -269,12 +281,100 @@ void scan_arbitrary(
 	int gridSize = getGridSize(numElems);
 	int blockSize = getBlockSize(numElems);
 
-	int thisGridSize = gridSize;
-	int thisNumElems = numElems;
-	deque<unsigned int*> D_blocksums;
-	deque<int> blocksum_gridsizes;
+	//int thisGridSize = gridSize;
+	//int thisNumElems = numElems;
 
-	do{
+	//deque<unsigned int*> D_scan_targets;
+	//deque<int> blocksum_numelems;
+	//D_scan_targets.push_back(d_elements);
+	//blocksum_numelems.push_back(gridSize);
+
+	int cycles = 0;
+	for( int tempGridSize = gridSize, 
+			 tempNumElems = numElems 
+		    ;tempNumElems > 1
+		    ;tempNumElems = tempGridSize, 
+		 	 tempGridSize = getGridSize(tempNumElems),
+			 cycles++
+	);//After the for loop cycles ends up being the correct size
+	//running this loop for i < cycles will loop the corresponding number of cycles in this loop.
+
+	vector<unsigned int*> D_scan_targets(cycles+1);
+	vector<int> blocksum_numelems(cycles+1);
+	scan_inplace_threads<<<gridSize,blockSize>>>( d_elements, numElems );
+	cudaDeviceSynchronize();
+	D_scan_targets[0] = d_elements;
+	blocksum_numelems[0] = numElems; 
+
+	for( int i = 0, 
+		     tempGridSize = gridSize,
+		     tempNumElems = numElems
+		    ;i < cycles
+			;i++
+	){
+		unsigned int * d_blockscan;
+		gpuErrchk( cudaMalloc( (void**)&d_blockscan , gridSize*sizeof(unsigned int) ) );
+		
+		scan_get_block_sum<<<tempGridSize,blockSize>>>(D_scan_targets[i], d_blockscan, tempNumElems);
+			cudaDeviceSynchronize();
+
+		//resize dimensions to calculate blocksums
+		tempNumElems = tempGridSize ;
+		tempGridSize = getGridSize(tempNumElems) ;
+		if( tempNumElems > 1 ){
+
+			scan_inplace_threads<<<tempGridSize,blockSize>>>( d_blockscan, tempNumElems );
+				cudaDeviceSynchronize();
+
+			D_scan_targets[i+1] = d_blockscan;
+			blocksum_numelems[i+1] = tempNumElems;
+			
+			//test
+			//cout << "i = " << i + 1 << endl;
+			//cout << "tempNumElems:" << tempNumElems << endl;
+
+		}
+
+	}
+
+	for(int i =  cycles - 1 ; i > 0 ; i-- ){
+		int tempGridSize = getGridSize( blocksum_numelems[i-1] );
+		
+		scan_add_block_sum<<<tempGridSize,blockSize>>>( D_scan_targets[i-1], D_scan_targets[i], blocksum_numelems[i-1] );
+		cudaDeviceSynchronize();
+		//Consider freeing memory here
+	}
+
+	//test print loop
+	/*
+	for( int i = cycles-1 ; i > 0 ; i--){
+		int memsize = blocksum_numelems[i] * sizeof(unsigned int);
+		unsigned int * h_blockscan = (unsigned int*)malloc( memsize ) ;
+		gpuErrchk( cudaMemcpy( h_blockscan, D_scan_targets[i] , memsize, cudaMemcpyDeviceToHost ));
+		cudaDeviceSynchronize();
+		cout << "h_blockscan:"; 
+		for( int j = 0 ; j < blocksum_numelems[i] ; j++ ){
+			cout << h_blockscan[j] << ",";
+		}
+		cout << endl;
+	}*/
+	//end test print loop
+
+	for( int i = 1 ; i < cycles ; i++ ){
+		cudaFree(D_scan_targets[i]);// free all the elements except the first since it is used again after function end.
+	}
+
+	//test
+	/*
+	for( int i = 0 ; i < cycles ; i++ ){
+		cout << "blocksum_numelems#" << i << blocksum_numelems[i];
+	}*/
+
+
+
+	//int cyclestest = 0;
+
+	/*do{
 		cout << "thisGridSize:" << thisGridSize << endl;
 		cout << "thisNumElems:" << thisNumElems << endl;
 		//kernel operations
@@ -288,18 +388,28 @@ void scan_arbitrary(
 		scan_get_block_sum<<<thisGridSize,blockSize>>>( d_elements, d_blocksums, numElems );
 			cudaDeviceSynchronize();
 
-		D_blocksums.push_back( d_blocksums );
-		blocksum_gridsizes.push_back(thisGridSize);
+		D_scan_targets.push_back( d_blocksums );
+		blocksum_numelems.push_back(thisGridSize);
 			//cout<< " scan_polishing " << endl;
 		
 
 		//concluding counter modification operations
 		thisNumElems = thisGridSize;
 		thisGridSize = getGridSize(thisNumElems);
+		cyclestest++;
 
-	}while(thisNumElems > 1);
+	}while( thisNumElems > 1 );*/
+	
+	//int i = 0;
+	//int j = 0;
+	//for(; i < cycles; i++){j++;}  //for rand1:
+	//cout << "j-test:" << j << endl; //j = 4
+	//cout << "i-test:" << i << endl; //i = 4
+	//cout << "cycles:" << cycles << endl; //cycles = 3
+	//cout << "cyctest:" << cyclestest << endl; //cyctest = 3
 
-	scan_polishing<<<thisGridSize,blockSize>>>( d_elements, d_predicate, d_middle, numElems);
+
+	scan_polishing<<<gridSize,blockSize>>>( d_elements, d_predicate, d_middle, numElems);
 			cudaDeviceSynchronize();
 	
 
@@ -317,13 +427,16 @@ void your_sort(unsigned int* const d_inputVals,
 	//unsigned int* d_inPosCopy;
 	unsigned int * d_predicate;
 	unsigned int* d_position2;
+	unsigned int* d_reposition_buffer;
 
 	gpuErrchk(cudaMalloc((void**)&d_predicate, filesize ));
 	gpuErrchk(cudaMalloc((void**)&d_position2, filesize ));
+	gpuErrchk(cudaMalloc((void**)&d_reposition_buffer, filesize ));
 
 	//set scan destination to 0;
-	gpuErrchk(cudaMemset( d_predicate, filesize, 0 ));
-	gpuErrchk(cudaMemcpy ( d_position1, d_inputPos, filesize,cudaMemcpyDeviceToDevice ));
+	gpuErrchk(cudaMemset( d_predicate, 0, filesize));
+	//gpuErrchk(cudaMemset( d_reposition_buffer, 0 , filesize ));
+	gpuErrchk(cudaMemcpy ( d_position1, d_inputPos, filesize, cudaMemcpyDeviceToDevice ));
 	gpuErrchk(cudaMemcpy ( d_position2, d_inputPos, filesize, cudaMemcpyDeviceToDevice ));
 	gpuErrchk(cudaMemcpy ( d_numbers, d_inputVals, filesize, cudaMemcpyDeviceToDevice ));//Values changed after calculating most significant element.
 
@@ -344,7 +457,7 @@ void your_sort(unsigned int* const d_inputVals,
 
 	for ( int current_bit = 0 ; (bitsig >> current_bit) > 1 ; current_bit++  ){
 		//unsigned int h_middle = 0;
-		cout << current_bit << endl;
+		cout << "currentbit:" << current_bit << endl;
 		gpuErrchk(cudaMemset(d_middle,0, sizeof(unsigned int)));
 			cudaDeviceSynchronize();
 
@@ -369,7 +482,7 @@ void your_sort(unsigned int* const d_inputVals,
 		scan_arbitrary(d_position2 , d_predicate, d_middle, numElems);
 			cudaDeviceSynchronize();
 
-		radix_reposition<<<gridSize,blockSize>>>(d_position1, d_position2, d_predicate, d_numbers, numElems );
+		radix_reposition<<<gridSize,blockSize>>>(d_position1, d_position2, d_predicate, d_numbers, d_reposition_buffer, numElems );
 			cudaDeviceSynchronize();
 			//cout<< "reposition" << endl;
 		//cout << "current_bit: " << current_bit <<endl;
@@ -430,10 +543,14 @@ void your_sort(unsigned int* const d_inputVals,
 	//d_numbers and d_position1 are needed to be persistent after the function concludes
 	//cudaFree(d_numbers);
 	//cudaFree(d_position1);
+	gpuErrchk( cudaMemcpy( d_inputVals, d_numbers, filesize, cudaMemcpyDeviceToDevice ));
+	gpuErrchk( cudaMemcpy( d_inputPos, d_position1, filesize, cudaMemcpyDeviceToDevice ));
+
 	cudaFree(d_predicate);
 	cudaFree(d_position2);
 	cudaFree(d_middle);
 }
+
 
 int main(int argc, char * argv[]){
 	if(argc !=  2){
