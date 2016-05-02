@@ -140,38 +140,55 @@ __global__ void scan_add_block_sum(
 	//if( index >= numElems ){ return; }
 	//if(blockIdx.x != 0){d_elements[index] += d_blocksums[blockIdx.x + 1]; }
 	if( index < numElems && index >= blockDim.x ){
-		int local_blocksum = d_blocksums[blockIdx.x - 1];
+		unsigned int local_blocksum = d_blocksums[blockIdx.x - 1];
 		d_elements[index] += local_blocksum;
 	} 
 
 }
 
-__global__ void scan_polishing( 
-										unsigned int * const d_elems,
-										unsigned int * const d_value_buffer,
-										unsigned int * const d_predicate,
-										unsigned int * const d_middle,
-										int numElems
-									  ){
+__global__ void scan_polishing1( 
+									unsigned int * const d_elems,
+									unsigned int * const d_predicate,
+									unsigned int * const d_middle,
+									int numElems
+								){
 	int index = threadIdx.x + blockDim.x * blockIdx.x;
 
 	//inclusive to exclusive
-	if( index <numElems ){
-		int temp = 0;
-		if( index != 0 ){d_value_buffer[index] = d_elems[index -1];}
-		d_elems[index] = d_value_buffer[index];
+	if( index < numElems ){
+		unsigned int temp = 0;
+		if( index != 0 ){ temp = d_elems[index -1];}
+		d_elems[index] = temp;
 	}
-	syncthreads();
 
-	//adding 'identity' to all elements
-	int identity = d_middle[0];
-	d_elems[index] += identity;
+}
 
-	if( index == numElems - 1 ){ 
+
+__global__ void scan_polishing2(
+									unsigned int * const d_elems,
+									unsigned int * const d_predicate,
+									unsigned int * const d_middle,
+									int numElems
+								){
+	int index = threadIdx.x + blockDim.x * blockIdx.x;
+	if(index < numElems){
+		unsigned int identity = d_middle[0];
+		d_elems[index] += identity;
+	}
+
+}
+
+__global__ void scan_polishing3(
+									unsigned int * const d_elems,
+									unsigned int * const d_predicate,
+									unsigned int * const d_middle,
+									int numElems									
+								){
+	int index = threadIdx.x + blockDim.x * blockIdx.x;
+	if( index == numElems - 1 && index < numElems){ 
 		d_middle[0] = d_elems[index];
 		d_middle[0] += d_predicate[index];
 	}
-
 }
 
 
@@ -189,25 +206,38 @@ __global__ void radix_reposition(
                              unsigned int* const d_predicate,
                              unsigned int* const d_values,
                              unsigned int* const d_value_buffer,
-                             int size){
+                             int size
+                             	){
 
 	int index = threadIdx.x + blockDim.x * blockIdx.x;
-	unsigned int displacement_index= 0;
 	if( index < size ){
+		unsigned int displacement_index = 0;
 		if(d_predicate[index] == 1){
 			displacement_index = d_position2[index];
 		}
 		else{
 			displacement_index = d_position1[index];
 		}
-		d_value_buffer[index] = d_values[index];
+		d_value_buffer[displacement_index] = d_values[index];
 	}
-	syncthreads();
-	if(index < size ){
-		d_values[displacement_index] = d_value_buffer[index];
-	}
-	
+	// after this copy value_buffer to values;
 }
+
+/*
+__global__ void radix_reposition2(
+							 unsigned int* const d_position1,
+						     unsigned int* const d_position2,
+                             unsigned int* const d_predicate,
+                             unsigned int* const d_values,
+                             unsigned int* const d_displacement_buffer,
+                             int size
+								 ){
+	int index = threadIdx.x + blockDim.x * blockIdx.x;
+	if(index < size ){
+		d_values[index] = d_value_buffer[index];
+	}
+}*/
+
 
 
 #define gpuErrchk(ans) { gpuAssert((ans), __FILE__, __LINE__); }
@@ -409,10 +439,13 @@ void scan_arbitrary(
 	//cout << "cyctest:" << cyclestest << endl; //cyctest = 3
 
 
-	scan_polishing<<<gridSize,blockSize>>>( d_elements, d_predicate, d_middle, numElems);
+	scan_polishing1<<<gridSize,blockSize>>>( d_elements, d_predicate, d_middle, numElems);
+			cudaDeviceSynchronize();
+	scan_polishing2<<<gridSize,blockSize>>>( d_elements, d_predicate, d_middle, numElems);
+			cudaDeviceSynchronize();
+	scan_polishing3<<<gridSize,blockSize>>>( d_elements, d_predicate, d_middle, numElems);
 			cudaDeviceSynchronize();
 	
-
 }
 
 void your_sort(unsigned int* const d_inputVals,
@@ -483,6 +516,8 @@ void your_sort(unsigned int* const d_inputVals,
 			cudaDeviceSynchronize();
 
 		radix_reposition<<<gridSize,blockSize>>>(d_position1, d_position2, d_predicate, d_numbers, d_reposition_buffer, numElems );
+			cudaDeviceSynchronize();
+		cudaMemcpy(d_numbers, d_reposition_buffer, filesize, cudaMemcpyDeviceToDevice );
 			cudaDeviceSynchronize();
 			//cout<< "reposition" << endl;
 		//cout << "current_bit: " << current_bit <<endl;
