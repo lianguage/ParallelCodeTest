@@ -206,6 +206,8 @@ __global__ void radix_reposition(
                              unsigned int* const d_predicate,
                              unsigned int* const d_values,
                              unsigned int* const d_value_buffer,
+                             unsigned int* const d_inputPos,//check
+                             unsigned int* const d_pos_buffer,
                              int size
                              	){
 
@@ -218,9 +220,35 @@ __global__ void radix_reposition(
 		else{
 			displacement_index = d_position1[index];
 		}
-		d_value_buffer[displacement_index] = d_values[index];
+		d_value_buffer[displacement_index] =   d_values[index];
+		d_pos_buffer[displacement_index]   = d_inputPos[index];
 	}
-	// after this copy value_buffer to values;
+	// after this copy value_buffer to values(after synchronization)
+}
+
+__global__ void regular_relocate1(
+									unsigned int* const d_values,
+									unsigned int* const d_position,
+									unsigned int* const d_value_buffer,
+									int size
+								){
+	int index = threadIdx.x + blockDim.x * blockIdx.x;
+	if( index < size ){
+		d_value_buffer[d_position[index]] = d_values[index];
+	}
+}
+
+__global__ void regular_relocate2(
+									unsigned int* const d_values,
+									unsigned int* const d_position,
+									unsigned int* const d_value_buffer,
+									int size
+								){
+	int index = threadIdx.x + blockDim.x * blockIdx.x;
+	if( index < size ){
+		d_values[index] = d_value_buffer[index];
+		d_position[index] = index;
+	}
 }
 
 /*
@@ -458,23 +486,34 @@ void your_sort(unsigned int* const d_inputVals,
 	const int filesize = numElems*sizeof(unsigned int);
 	//unsigned int* d_positionCopy;
 	//unsigned int* d_inPosCopy;
-	unsigned int * d_predicate;
+	unsigned int* d_predicate;
 	unsigned int* d_position2;
-	unsigned int* d_reposition_buffer;
+	unsigned int* d_numbers_buffer;
+	unsigned int* d_inputPos_buffer;
+
+	int blockSize =  getBlockSize(numElems);
+	int gridSize = getGridSize(numElems);
+
 
 	gpuErrchk(cudaMalloc((void**)&d_predicate, filesize ));
 	gpuErrchk(cudaMalloc((void**)&d_position2, filesize ));
-	gpuErrchk(cudaMalloc((void**)&d_reposition_buffer, filesize ));
+	gpuErrchk(cudaMalloc((void**)&d_numbers_buffer, filesize ));
+	gpuErrchk(cudaMalloc((void**)&d_inputPos_buffer, filesize ));
+
+	//move all elements such that the position vector is in sorted order.
+	regular_relocate1<<<gridSize,blockSize>>>(d_inputVals, d_inputPos, d_numbers_buffer, numElems);
+		cudaDeviceSynchronize();
+	regular_relocate2<<<gridSize,blockSize>>>(d_inputVals, d_inputPos, d_numbers_buffer, numElems);
+		cudaDeviceSynchronize();
 
 	//set scan destination to 0;
 	gpuErrchk(cudaMemset( d_predicate, 0, filesize));
-	//gpuErrchk(cudaMemset( d_reposition_buffer, 0 , filesize ));
+	//gpuErrchk(cudaMemset( d_numbers_buffer, 0 , filesize ));
 	gpuErrchk(cudaMemcpy ( d_position1, d_inputPos, filesize, cudaMemcpyDeviceToDevice ));
 	gpuErrchk(cudaMemcpy ( d_position2, d_inputPos, filesize, cudaMemcpyDeviceToDevice ));
 	gpuErrchk(cudaMemcpy ( d_numbers, d_inputVals, filesize, cudaMemcpyDeviceToDevice ));//Values changed after calculating most significant element.
 
-	int blockSize =  getBlockSize(numElems);
-	int gridSize = getGridSize(numElems);
+
 	unsigned int * d_middle;
 	gpuErrchk(cudaMalloc((void**)&d_middle, sizeof(unsigned int) ));
 	unsigned int bitsig = find_max_reduce( d_numbers, numElems);//find the largest element, so the number of bits to run radix is known.
@@ -485,8 +524,6 @@ void your_sort(unsigned int* const d_inputVals,
 	//cout<< "bitsig:" << bitsig << endl;
 	//cout<< "max_uint:" << UINT_MAX << endl;
 
-	unsigned int * d_auxarray;//used by the scan kernel for storing block sums, since threads cannot be relied on being in sync.
-	gpuErrchk( cudaMalloc((void**)&d_auxarray, gridSize*sizeof(unsigned int) )); //needs to hold as many elements as there are blocks.
 
 	for ( int current_bit = 0 ; (bitsig >> current_bit) > 1 ; current_bit++  ){
 		//unsigned int h_middle = 0;
@@ -515,9 +552,10 @@ void your_sort(unsigned int* const d_inputVals,
 		scan_arbitrary(d_position2 , d_predicate, d_middle, numElems);
 			cudaDeviceSynchronize();
 
-		radix_reposition<<<gridSize,blockSize>>>(d_position1, d_position2, d_predicate, d_numbers, d_reposition_buffer, numElems );
+		radix_reposition<<<gridSize,blockSize>>>(d_position1, d_position2, d_predicate, d_numbers, d_numbers_buffer, d_inputPos, d_inputPos_buffer, numElems );
 			cudaDeviceSynchronize();
-		cudaMemcpy(d_numbers, d_reposition_buffer, filesize, cudaMemcpyDeviceToDevice );
+		cudaMemcpy(d_numbers, d_numbers_buffer, filesize, cudaMemcpyDeviceToDevice );
+		cudaMemcpy(d_inputPos, d_inputPos_buffer, filesize, cudaMemcpyDeviceToDevice );
 			cudaDeviceSynchronize();
 			//cout<< "reposition" << endl;
 		//cout << "current_bit: " << current_bit <<endl;
@@ -579,7 +617,7 @@ void your_sort(unsigned int* const d_inputVals,
 	//cudaFree(d_numbers);
 	//cudaFree(d_position1);
 	gpuErrchk( cudaMemcpy( d_inputVals, d_numbers, filesize, cudaMemcpyDeviceToDevice ));
-	gpuErrchk( cudaMemcpy( d_inputPos, d_position1, filesize, cudaMemcpyDeviceToDevice ));
+	gpuErrchk( cudaMemcpy( d_position1, d_inputPos, filesize, cudaMemcpyDeviceToDevice ));
 
 	cudaFree(d_predicate);
 	cudaFree(d_position2);
@@ -646,13 +684,14 @@ int main(int argc, char * argv[]){
 		//cudaDeviceSynchronize();
 
 		gpuErrchk( cudaMemcpy( h_numbers, d_out_numbers ,filesize, cudaMemcpyDeviceToHost));
+		gpuErrchk( cudaMemcpy (h_position, d_position, filesize, cudaMemcpyDeviceToHost));
 		cudaDeviceSynchronize();
 		ofstream sortedfile("sorted");
-		if( sortedfile.is_open()){
-			for(int i = 0 ; i < lines ; i++){
-				sortedfile << std::to_string(h_numbers[i]) << "\n";
-			}
-		}
+	    if( sortedfile.is_open()){
+	      for(int i = 0 ; i < lines ; i++){
+	        sortedfile << std::to_string(h_numbers[i]) << "         " <<   to_string(h_position[i])   <<"\n";
+	      }
+	    }
 		std::cout << "finished" <<std::endl;
 
 		return 0;
