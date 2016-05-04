@@ -40,16 +40,14 @@
     */
 #include "assert.h"
 
-//are these needed?
-#include <cuda_runtime.h>
+#include <cuda_runtime.h> //used for assert
 #include <iostream>
-//#include <helper_cuda.h>
 
 #include <fstream>
 #include <string>
 #include <climits>
 
-//@max_reduce tested.
+
 __global__ void max_reduce(   unsigned int* const d_position,
                               unsigned int* const d_result,
                               int size
@@ -76,7 +74,6 @@ __global__ void max_reduce(   unsigned int* const d_position,
 }
 
 
-//@radix_predicate tested
 __global__ void radix_predicate(   unsigned int * const d_input,
                                    //unsigned int* const d_position,
                                    unsigned int * const d_predicate,
@@ -87,8 +84,6 @@ __global__ void radix_predicate(   unsigned int * const d_input,
 	int index = threadIdx.x + blockDim.x*blockIdx.x;
 	if(index >= size ){ return; }
 
-	//int position = d_position[index];
-	//predicate: (i & 1) == 0;
 	unsigned int x = d_input[index];
 	x >>= current_bit;
 	d_predicate[index] = x&1;
@@ -123,7 +118,6 @@ __global__ void scan_get_block_sum(
 								int numElems
 							 ){
 	int index = threadIdx.x + blockIdx.x * blockDim.x;
-	//if(index >= numElems ){ return; } //syncthreads not used, so early exit is not a problem
 	
 	if( threadIdx.x + 1 == blockDim.x && index < numElems || index+1 == numElems ){ 
 		d_blocksums[blockIdx.x] = d_scanned_elements[index];
@@ -137,8 +131,7 @@ __global__ void scan_add_block_sum(
 										int numElems
 									 ){
 	int index = threadIdx.x + blockDim.x * blockIdx.x;
-	//if( index >= numElems ){ return; }
-	//if(blockIdx.x != 0){d_elements[index] += d_blocksums[blockIdx.x + 1]; }
+
 	if( index < numElems && index >= blockDim.x ){
 		unsigned int local_blocksum = d_blocksums[blockIdx.x - 1];
 		d_elements[index] += local_blocksum;
@@ -251,24 +244,8 @@ __global__ void regular_relocate2(
 	}
 }
 
-/*
-__global__ void radix_reposition2(
-							 unsigned int* const d_position1,
-						     unsigned int* const d_position2,
-                             unsigned int* const d_predicate,
-                             unsigned int* const d_values,
-                             unsigned int* const d_displacement_buffer,
-                             int size
-								 ){
-	int index = threadIdx.x + blockDim.x * blockIdx.x;
-	if(index < size ){
-		d_values[index] = d_value_buffer[index];
-	}
-}*/
 
-
-
-#define gpuErrchk(ans) { gpuAssert((ans), __FILE__, __LINE__); }
+#define gpuErrchk(ans) { gpuAssert((ans), __FILE__, __LINE__); } // copied from stack overflow, used to check gpuError codes while debugging.
 inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=true)
 {
    if (code != cudaSuccess) 
@@ -282,6 +259,8 @@ inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=t
 
 using namespace std;
 
+
+//Functions to calculate gridSize and blockSize consistently.
 int getBlockSize(int numElems){
 	if(numElems > MAX_BLOCKSZ){
 		return MAX_BLOCKSZ;
@@ -297,7 +276,7 @@ int getGridSize(int numElems){
 
 
 
-//@find_max_reduce tested
+//find max reduce works by reducing blocks then reducing the result of the blocks.
 int find_max_reduce( unsigned int* const d_position , int numElems ){
 	int blockSize = getBlockSize(numElems);
 	int gridSize = getGridSize(numElems);
@@ -328,7 +307,9 @@ int find_max_reduce( unsigned int* const d_position , int numElems ){
 }
 
 #include <queue>
-
+//Scan arbitrary is a function that utilises a series of kernel calls to run a Hillis and Steele scan
+//It scans on block level with sync threads, then takes the block sums from each block and runs
+//another scan on that in a loop until there number of elements remaining can fit into a single block.
 void scan_arbitrary( 
 						unsigned int * const d_elements,
 						unsigned int * const d_predicate,
@@ -338,14 +319,6 @@ void scan_arbitrary(
 	cout << "====arbitrary scan====" << endl;
 	int gridSize = getGridSize(numElems);
 	int blockSize = getBlockSize(numElems);
-
-	//int thisGridSize = gridSize;
-	//int thisNumElems = numElems;
-
-	//deque<unsigned int*> D_scan_targets;
-	//deque<int> blocksum_numelems;
-	//D_scan_targets.push_back(d_elements);
-	//blocksum_numelems.push_back(gridSize);
 
 	int cycles = 0;
 	for( int tempGridSize = gridSize, 
@@ -386,10 +359,6 @@ void scan_arbitrary(
 
 			D_scan_targets[i+1] = d_blockscan;
 			blocksum_numelems[i+1] = tempNumElems;
-			
-			//test
-			//cout << "i = " << i + 1 << endl;
-			//cout << "tempNumElems:" << tempNumElems << endl;
 
 		}
 
@@ -403,69 +372,10 @@ void scan_arbitrary(
 		//Consider freeing memory here
 	}
 
-	//test print loop
-	/*
-	for( int i = cycles-1 ; i > 0 ; i--){
-		int memsize = blocksum_numelems[i] * sizeof(unsigned int);
-		unsigned int * h_blockscan = (unsigned int*)malloc( memsize ) ;
-		gpuErrchk( cudaMemcpy( h_blockscan, D_scan_targets[i] , memsize, cudaMemcpyDeviceToHost ));
-		cudaDeviceSynchronize();
-		cout << "h_blockscan:"; 
-		for( int j = 0 ; j < blocksum_numelems[i] ; j++ ){
-			cout << h_blockscan[j] << ",";
-		}
-		cout << endl;
-	}*/
-	//end test print loop
 
 	for( int i = 1 ; i < cycles ; i++ ){
 		cudaFree(D_scan_targets[i]);// free all the elements except the first since it is used again after function end.
 	}
-
-	//test
-	/*
-	for( int i = 0 ; i < cycles ; i++ ){
-		cout << "blocksum_numelems#" << i << blocksum_numelems[i];
-	}*/
-
-
-
-	//int cyclestest = 0;
-
-	/*do{
-		cout << "thisGridSize:" << thisGridSize << endl;
-		cout << "thisNumElems:" << thisNumElems << endl;
-		//kernel operations
-		scan_inplace_threads<<<thisGridSize,blockSize>>>( d_elements, numElems );
-			cudaDeviceSynchronize();
-			//cout<< "inplace_threads" << endl;
-		
-		unsigned int * d_blocksums;
-		gpuErrchk(cudaMalloc((void**)&d_blocksums, thisGridSize*sizeof(unsigned int) ));
-			cudaDeviceSynchronize();
-		scan_get_block_sum<<<thisGridSize,blockSize>>>( d_elements, d_blocksums, numElems );
-			cudaDeviceSynchronize();
-
-		D_scan_targets.push_back( d_blocksums );
-		blocksum_numelems.push_back(thisGridSize);
-			//cout<< " scan_polishing " << endl;
-		
-
-		//concluding counter modification operations
-		thisNumElems = thisGridSize;
-		thisGridSize = getGridSize(thisNumElems);
-		cyclestest++;
-
-	}while( thisNumElems > 1 );*/
-	
-	//int i = 0;
-	//int j = 0;
-	//for(; i < cycles; i++){j++;}  //for rand1:
-	//cout << "j-test:" << j << endl; //j = 4
-	//cout << "i-test:" << i << endl; //i = 4
-	//cout << "cycles:" << cycles << endl; //cycles = 3
-	//cout << "cyctest:" << cyclestest << endl; //cyctest = 3
-
 
 	scan_polishing1<<<gridSize,blockSize>>>( d_elements, d_predicate, d_middle, numElems);
 			cudaDeviceSynchronize();
@@ -476,6 +386,10 @@ void scan_arbitrary(
 	
 }
 
+
+//Note the use of global memory in the reposition phases.
+//I wasn't sure how else to ensure that relocations happened in sync so I ran them in separate kernels so that
+// each step was guaranteed to be completed before moving onto the next ie-  block level synchronisation was needed.
 void your_sort(unsigned int* const d_inputVals,
                unsigned int* const d_inputPos,
                unsigned int* const d_numbers,
@@ -484,8 +398,7 @@ void your_sort(unsigned int* const d_inputVals,
 {
 
 	const int filesize = numElems*sizeof(unsigned int);
-	//unsigned int* d_positionCopy;
-	//unsigned int* d_inPosCopy;
+
 	unsigned int* d_predicate;
 	unsigned int* d_position2;
 	unsigned int* d_numbers_buffer;
@@ -516,33 +429,30 @@ void your_sort(unsigned int* const d_inputVals,
 
 	unsigned int * d_middle;
 	gpuErrchk(cudaMalloc((void**)&d_middle, sizeof(unsigned int) ));
-	unsigned int bitsig = find_max_reduce( d_numbers, numElems);//find the largest element, so the number of bits to run radix is known.
+	unsigned int bitsig = find_max_reduce( d_numbers, numElems);
 	cout<< "bitsig:" << bitsig << endl;
 	if( bitsig <= UINT_MAX/2 ){ bitsig <<= 1; }
 	else{ bitsig = UINT_MAX; }
 
-	//cout<< "bitsig:" << bitsig << endl;
-	//cout<< "max_uint:" << UINT_MAX << endl;
-
 
 	for ( int current_bit = 0 ; (bitsig >> current_bit) > 1 ; current_bit++  ){
-		//unsigned int h_middle = 0;
+
 		cout << "currentbit:" << current_bit << endl;
 		gpuErrchk(cudaMemset(d_middle,0, sizeof(unsigned int)));
 			cudaDeviceSynchronize();
 
 		radix_predicate<<<gridSize,blockSize>>>(d_numbers, d_predicate, current_bit, numElems);
 			cudaDeviceSynchronize();
-			//cout<< "radix_predicate" << endl;
+
 		radix_invert_predicate<<<gridSize,blockSize>>>(d_predicate, numElems);
 			cudaDeviceSynchronize();
-			//cout<< "invert_predicate" << endl;
+
 		cudaMemcpy(d_position1, d_predicate, filesize, cudaMemcpyDeviceToDevice);
 			cudaDeviceSynchronize();
 
 		scan_arbitrary(d_position1 ,d_predicate, d_middle, numElems);
 			cudaDeviceSynchronize();
-			//cout<< "scan_arbitrary" << endl;
+
 		radix_invert_predicate<<<gridSize,blockSize>>>(d_predicate, numElems);
 			cudaDeviceSynchronize();
 
@@ -557,65 +467,8 @@ void your_sort(unsigned int* const d_inputVals,
 		cudaMemcpy(d_numbers, d_numbers_buffer, filesize, cudaMemcpyDeviceToDevice );
 		cudaMemcpy(d_inputPos, d_inputPos_buffer, filesize, cudaMemcpyDeviceToDevice );
 			cudaDeviceSynchronize();
-			//cout<< "reposition" << endl;
-		//cout << "current_bit: " << current_bit <<endl;
-		//cout << "bitsig>>currentbit" << (bitsig >> current_bit) << endl;
-		//start @test
-		/*
-		unsigned int * h_numbers = (unsigned int*) malloc( filesize);
-		unsigned int * h_position1 = (unsigned int*) malloc(filesize);
-		unsigned int * h_position2 = (unsigned int*) malloc( filesize);
-		unsigned int * h_bools = (unsigned int *)malloc(filesize);
-		
-		gpuErrchk( cudaMemcpy( h_numbers, d_numbers, filesize, cudaMemcpyDeviceToHost));
-		cudaDeviceSynchronize();
-		gpuErrchk( cudaMemcpy( h_bools, d_predicate, filesize, cudaMemcpyDeviceToHost));
-		cudaDeviceSynchronize();
-		gpuErrchk( cudaMemcpy( h_position1, d_position1, filesize, cudaMemcpyDeviceToHost));
-		cudaDeviceSynchronize();
-		gpuErrchk( cudaMemcpy( h_position2, d_position2, filesize, cudaMemcpyDeviceToHost));
-		cudaDeviceSynchronize();
-		//cudaMemcpy( h_position2, d_position2, filesize, cudaMemcpyDeviceToHost);
-		//cudaMemcpy( h_position1, d_position1, filesize, cudaMemcpyDeviceToHost);
-		//cudaMemcpy( h_bools, d_predicate, filesize, cudaMemcpyDeviceToHost);
-		//cudaMemcpy( h_numbers, d_numbers, filesize, cudaMemcpyDeviceToHost);
-
-		cout << " bools : {";
-		for(int i = 0 ; i < numElems ; i++){
-			cout << std::to_string(h_bools[i]) << ", ";
-			//std::cout << "adsf" <<std::endl; //@test
-		}
-		cout << "} \n";
-		cout << " numbers : {";
-		for(int i = 0 ; i < numElems ; i++){
-			cout << std::to_string(h_numbers[i]) << ", ";
-			//std::cout << "adsf" <<std::endl; //@test
-		}
-		cout << "} \n";
-		cout << " position1 : {";
-		for(int i = 0 ; i < numElems ; i++){
-			cout << std::to_string(h_position1[i]) << ", ";
-			//std::cout << "adsf" <<std::endl; //@test
-		}
-		cout << "} \n";
-		cout << " position 2 : {";
-		for(int i = 0 ; i < numElems ; i++){
-			cout << std::to_string(h_position2[i]) << ", ";
-			//std::cout << "adsf" <<std::endl; //@test
-		}
-		cout << "} \n";
-		//end @test
-		free(h_numbers);
-		free(h_bools);
-		free(h_position1);
-		free(h_position2);
-		*/
 	}
-	//cout << "rwar";
 
-	//d_numbers and d_position1 are needed to be persistent after the function concludes
-	//cudaFree(d_numbers);
-	//cudaFree(d_position1);
 	gpuErrchk( cudaMemcpy( d_inputVals, d_numbers, filesize, cudaMemcpyDeviceToDevice ));
 	gpuErrchk( cudaMemcpy( d_position1, d_inputPos, filesize, cudaMemcpyDeviceToDevice ));
 
@@ -644,9 +497,7 @@ int main(int argc, char * argv[]){
 			h_numbers = (unsigned int *)malloc(filesize);
 			h_position = (unsigned int *)malloc(filesize);
 			int i = 0;
-			//cout << "moo:" << size << endl;
 			while(getline(myfile, line)){
-				 //cout << line << endl;
 				 h_numbers[i] = atoi(line.c_str());
 				 h_position[i] = i;
 				 lines++;
