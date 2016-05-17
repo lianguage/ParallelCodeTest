@@ -4,8 +4,8 @@
 #include <cstdlib>
 #include <ctime>
 
-#define filesize 4242424
-#define bins 12345
+#define filesize 10240000
+#define bins 1024
 
 using namespace std;
 
@@ -19,8 +19,8 @@ int main () {
 	for( int i = 0 ; i < filesize ; i++ ){
 		myfile << rand()%bins << endl;
 	}
-
+	
 	myfile.close();
-
+	
 	return 0;
 }
