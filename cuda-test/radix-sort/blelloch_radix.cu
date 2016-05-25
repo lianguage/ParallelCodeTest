@@ -99,24 +99,8 @@ __global__ void scan_add_block_sum(
 
 }
 
-//inclusive to exclusive
-__global__ void scan_polishing1( 
-									unsigned int * const d_elems,
-									unsigned int * const d_predicate,
-									unsigned int * const d_middle,
-									int numElems
-								){
-	int index = threadIdx.x + blockDim.x * blockIdx.x;
 
-	if( index < numElems ){
-		unsigned int temp = 0;
-		if( index != 0 ){ temp = d_elems[index -1];}
-		d_elems[index] = temp;
-	}
 
-}
-
-//start scan from arbitrary value.
 __global__ void scan_polishing2(
 									unsigned int * const d_elems,
 									unsigned int * const d_predicate,
@@ -131,7 +115,6 @@ __global__ void scan_polishing2(
 
 }
 
-//
 __global__ void scan_polishing3(
 									unsigned int * const d_elems,
 									unsigned int * const d_predicate,

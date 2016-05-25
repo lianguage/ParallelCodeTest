@@ -1,3 +1,58 @@
+/*bug demostrated by following gdb output::
+
+
+
+
+liang@Sonny:~/radix-sort$ cuda-gdb kerneltest.exe
+NVIDIA (R) CUDA Debugger
+7.5 release
+Portions Copyright (C) 2007-2015 NVIDIA Corporation
+GNU gdb (GDB) 7.6.2
+Copyright (C) 2013 Free Software Foundation, Inc.
+License GPLv3+: GNU GPL version 3 or later <http://gnu.org/licenses/gpl.html>
+This is free software: you are free to change and redistribute it.
+There is NO WARRANTY, to the extent permitted by law.  Type "show copying"
+and "show warranty" for details.
+This GDB was configured as "x86_64-unknown-linux-gnu".
+For bug reporting instructions, please see:
+<http://www.gnu.org/software/gdb/bugs/>...
+Reading symbols from /home/liang/Documents/ParallelTestCode/cuda-test/radix-sort/kerneltest.exe...done.
+(cuda-gdb) set args ones10000.rand 
+(cuda-gdb) break 196
+Breakpoint 1 at 0x403c95: file kerneltester.cu, line 196.
+(cuda-gdb) 198
+Undefined command: "198".  Try "help".
+(cuda-gdb) break 198
+Breakpoint 2 at 0x403d55: file kerneltester.cu, line 198.
+(cuda-gdb) break 200
+Breakpoint 3 at 0x403d5a: file kerneltester.cu, line 200.
+(cuda-gdb) run
+Starting program: /home/liang/Documents/ParallelTestCode/cuda-test/radix-sort/kerneltest.exe ones10000.rand 
+[Thread debugging using libthread_db enabled]
+Using host libthread_db library "/lib/x86_64-linux-gnu/libthread_db.so.1".
+[New Thread 0x7ffff5c15700 (LWP 4653)]
+[New Thread 0x7fffed3ff700 (LWP 4655)]
+nextmark:10000
+it_gridSz:9
+
+Breakpoint 1, arbitrary_scan (h_elements=0x675560, numElems=10000) at kerneltester.cu:196
+196       if( it_remSz  ){ hillisteel_tailsum<<<1, it_remSz,shareSize>>>( d_elements + remMark, it_remSz, nextmark + it_gridSz ); }
+(cuda-gdb) continue
+Continuing.
+
+Breakpoint 2, arbitrary_scan (h_elements=0x675560, numElems=10000) at kerneltester.cu:198
+198       cudaDeviceSynchronize();
+(cuda-gdb) print h_test_elements[10000]
+$1 = 1025
+(cuda-gdb) print h_test_elements[10000]@11
+$2 = {1025, 1025, 1025, 1025, 1025, 1025, 1025, 1025, 1025, 9216, 18432}
+(cuda-gdb) 
+
+*/
+
+
+
+
 
 #include "assert.h"
 
@@ -15,14 +70,17 @@
 
 __global__ void bookmark_blocksum( 
   unsigned int* d_elements, 
+           int* d_bookmarks,
             int blockSumNumElems,
-            int nextmark)
+            int depth)
 {
   int index = threadIdx.x + blockDim.x * blockIdx.x;
-  if( 2*index+1 < blockSumNumElems){
+  if( depth > 0 && 2*index+1 < blockSumNumElems){
+    int blocks_mark = d_bookmarks[depth-1];
+    int sum_mark = d_bookmarks[depth];
     //d_elements[blocks_mark + index] = 0;
-    d_elements[2*index] +=  d_elements[nextmark + blockIdx.x];
-    d_elements[2*index + 1] +=  d_elements[nextmark + blockIdx.x];
+    d_elements[blocks_mark + 2*index] +=  d_elements[sum_mark + blockIdx.x];
+    d_elements[blocks_mark + 2*index + 1 ] +=  d_elements[sum_mark + blockIdx.x];
   }
   else{
     //@todo throw some kind of error. consider using assert or something here instead.
@@ -30,12 +88,18 @@ __global__ void bookmark_blocksum(
 }
 
 
-__global__ void blelloch_threadsum( 
+__global__ void blelloch_threadsum(
   unsigned int* d_elements,
             int numElems,
             int nextmark)
 {
-    //@note @unexplained behavior, see blelloch-weirdbug.cu
+
+    //@note @unexplained for some reason this kernel
+    //will modify memory beyond the last nextmark index
+    //in a way that seems to correspond to the data before it
+    //but this does not affect the running of the kernel in any other way.
+    //will need to test further.
+  
     extern __shared__ unsigned int shared[];
     int index = threadIdx.x + blockDim.x * blockIdx.x;
     int tid = threadIdx.x;
@@ -58,7 +122,7 @@ __global__ void blelloch_threadsum(
     }
 
     if(tid == 0  ){
-      d_elements[nextmark + blockIdx.x] = shared[2*blockDim.x - 1];
+      d_elements[nextmark + blockIdx.x] = shared[2*blockDim.x - 1]+1;
       shared[2*blockDim.x - 1] = 0;
     }
 
@@ -110,7 +174,7 @@ __global__ void hillisteel_tailsum( //only use this for the last block of an arr
     d_elements[tid+1] = shared[tid];
   }
   else if( tid == numElems-1){
-    //d_elements[nextmark] = shared[tid];
+    d_elements[nextmark] = shared[tid];
     d_elements[0] = 0;
   }
 
@@ -186,6 +250,8 @@ void arbitrary_scan( unsigned int * h_elements, int numElems){
           it_gridSz = it_numElems/(2*MAX_BLOCKSZ),
           remMark   = h_bookmarks[i+1] - it_remSz,
           nextmark  = h_bookmarks[i+1] - h_bookmarks[i];
+      std::cout << "nextmark:"  << nextmark << std::endl;
+      std::cout << "it_gridSz:" << it_gridSz << std::endl;
       //run the relevant kernel if conditions are correct
       if( it_gridSz ){ blelloch_threadsum<<<it_gridSz, MAX_BLOCKSZ, shareSize>>>( d_elements + h_bookmarks[i] , it_numElems, nextmark ); }
       gpuErrchk( cudaMemcpy( h_test_elements, d_elements, worksize, cudaMemcpyDeviceToHost)); //@test - used for checking memory in cuda-gdb.
@@ -197,20 +263,18 @@ void arbitrary_scan( unsigned int * h_elements, int numElems){
       it_numElems = it_gridSz + (it_remSz >= 1) ;
       it_gridSz   = it_numElems;
     }
-    
-    for( int i = depth ; i > 0 ; i--){
+
+    /*
+    for( int i = depth ; i >= 1 ; i--){
       int it_numElems  = h_bookmarks[i] - h_bookmarks[i-1],
           it_blockSz   = getBlockSize(it_numElems),
-          it_gridSz    = getGridSize (it_numElems),
-          nextmark     = h_bookmarks[i] - h_bookmarks[i-1];
-      bookmark_blocksum<<<it_gridSz,it_blockSz>>>(d_elements + h_bookmarks[i-1], it_numElems, nextmark);
+          it_gridSz    = getGridSize (it_numElems);
+      blelloch_blocksum<<<it_gridSz,it_blockSz>>>(d_elements, d_bookmarks,it_numElems, i);
       cudaDeviceSynchronize();
-    }
+    }*/
     gpuErrchk( cudaMemcpy( h_test_elements, d_elements, worksize, cudaMemcpyDeviceToHost)); //@test - used for checking memory in cuda-gdb.
     gpuErrchk( cudaMemcpy( h_elements, d_elements, filesize, cudaMemcpyDeviceToHost)); 
 }
-
-
 
 
 int main(int argc, char * argv[]){

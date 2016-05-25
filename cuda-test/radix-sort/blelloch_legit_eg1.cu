@@ -12,7 +12,7 @@
 
 //backup version stored as kt_backup.cu
 
-#define MAXSHID2 2*blockDim.x-1
+//#define MAXSHID2 2*blockDim.x-1
 #define INNERGRID gridDim.x/blockDim.x
 #define MAX_BLOCKSZ 512
 
@@ -29,7 +29,7 @@ __device__ int d_getGridSize(int numElems){
   return (numElems + MAX_BLOCKSZ -1)/MAX_BLOCKSZ;
 }
 
-__global__ void blelloch_blocksums( 
+__global__ void blelloch_blocksum( 
   unsigned int* d_elements, 
            int* d_bookmarks,
             int blockSumNumElems,
@@ -47,11 +47,10 @@ __global__ void blelloch_blocksums(
     //throw some kind of error. consider using assert or something here instead.
   }
 
-
 }
 
 
-__global__ void blelloch2_reduction(
+__global__ void blelloch_threadsums(
   unsigned int* d_elements,
            int* d_bookmarks,
             int numElems,
@@ -61,63 +60,52 @@ __global__ void blelloch2_reduction(
     int index = threadIdx.x + blockDim.x * blockIdx.x;
     int tid = threadIdx.x;
     int bookmark = d_bookmarks[depth];
-    //int nextmark = d_bookmarks[depth+1];
 
-    if( 2*index + 1 < numElems ){
+
+    if( 2*index+1 < numElems && 2*index < numElems ){
       shared[2*tid] = d_elements[2*index + bookmark];
       shared[2*tid+1] = d_elements[2*index+1 + bookmark];
     }
     __syncthreads();
 
-    //this loop will work in a way that a binomial tree rooted at tid = MAXSHID2 will be formed
-    //to root it at zero, remove the MAXSHID2 component.
-    for( int s = 1; s <= blockDim.x ; s <<= 1 ){
-      if( 2*s*tid + s < 2*blockDim.x ){ // in the books tid = 0 is shown as the first, however in this code it refers to the last element in the respective diagram. see: http://http.developer.nvidia.com/GPUGems3/gpugems3_ch39.html
-        unsigned int dest = shared[MAXSHID2 - 2*s*tid]; //the inclusion of blockdim and subtracting the 2*s*tid factor in the index reverses the order of if only the factor is used.
-        unsigned int addn = shared[MAXSHID2 - 2*s*tid - s];
-        shared[MAXSHID2 - 2*s*tid] = dest + addn;
-      }
+    int s = 1;
+    for( int d = blockDim.x ; d > 0  ; d >>= 1 ){
       __syncthreads();
+      if( tid < d){ 
+        unsigned int addn = shared[s*(2*tid + 1) - 1];
+        unsigned int dest = shared[s*(2*tid + 2) - 1];
+        shared[s*(2*tid + 2) - 1] = dest + addn;
+      }
+      s *= 2;
     }
     if(gridDim.x > 1){
       int nextmark = d_bookmarks[depth+1];
-      d_elements[nextmark + blockIdx.x] = shared[MAXSHID2];
+      d_elements[nextmark + blockIdx.x] = shared[0];
     }
-
+    
+    
     if(tid == 0  ){
-      shared[MAXSHID2] = 0;
+      shared[2*blockDim.x - 1] = 0;
     }
 
-    for( int s = blockDim.x ; s > 0 ; s >>= 1){
-      if( 2*s*tid + s < 2*blockDim.x ){
-        unsigned int dest = shared[MAXSHID2 - 2*s*tid];
-        unsigned int addn = shared[MAXSHID2 - 2*s*tid - s];
-        shared[MAXSHID2 - 2*s*tid] = dest + addn;
-        shared[MAXSHID2 - 2*s*tid - s] = dest;
-      }
+    for( int d = 1 ; d < 2*blockDim.x ; d *= 2 ){
+      s >>= 1;
       __syncthreads();
-    }
-
-    if( 2*index + 1 < numElems ){
-      d_elements[2*index + bookmark] = shared[2*tid];
-      d_elements[2*index + 1 + bookmark] = shared[2*tid + 1];
+      if(tid < d){
+        unsigned int addn = shared[s*(2*tid + 1) - 1];
+        unsigned int dest = shared[s*(2*tid + 2) - 1];
+        shared[s*(2*tid + 1) - 1] = dest;
+        shared[s*(2*tid + 2) - 1] = dest + addn;
+      }
     }
     __syncthreads();
-
     
-    if( index == 0 && gridDim.x > 1 ){
-      int innerblockdim = min(blockDim.x,gridDim.x); 
-      int innergriddim = (gridDim.x + blockDim.x -1)/blockDim.x;
-      blelloch2_reduction<<<innergriddim,innerblockdim>>>( d_elements, d_bookmarks , gridDim.x, depth+1 );
-    }
-    else if( index == 0 && gridDim.x == 1){
-      int bsum_numElems = d_bookmarks[depth] - d_bookmarks[depth-1];
-      int bsum_blockdim = d_getBlockSize(bsum_numElems);
-      int bsum_griddim = d_getGridSize(bsum_numElems);
-      int bsum_shared = 2*bsum_blockdim*sizeof(unsigned int);
-      blelloch_blocksums<<<bsum_griddim,bsum_blockdim,bsum_shared>>>(d_elements, d_bookmarks, bsum_numElems, depth);
-    }
 
+    //if( 2*index + 1 < numElems ){
+    d_elements[2*index + bookmark] = shared[2*tid];
+    d_elements[2*index + 1 + bookmark] = shared[2*tid + 1];
+    //}
+    __syncthreads();
     
 }
 
@@ -161,14 +149,16 @@ void arbitrary_scan( unsigned int * h_elements, int numElems){
     vector<int> h_bookmarks(bookmarks_sz, 0); //@improve? 128 is arbitrarily selected, since the final size is unknown, and a resize every single loop is not preferable. Hence a resize every '32' is used.
     int workneeded = numElems;
     int depth = 0;
-    for( int tmp_elems = gridSize ; tmp_elems > 1 ; tmp_elems = getGridSize(tmp_elems/blockSize) ) {
+    for( int tmp_elems = gridSize ; tmp_elems > 1 ; tmp_elems = getGridSize(tmp_elems) ) {
       depth++;
       if( depth >= bookmarks_sz ){ //if too deep, increase size to allow for more bookmark entries. 
         bookmarks_sz += 128;
         h_bookmarks.resize(bookmarks_sz); 
       }
       h_bookmarks[depth] = workneeded; //note depth 0 case was not specifically handled by loop, but is set to 0 by initialisation of the vector, and is simply skipped by loop.
+      //std::cout << workneeded << std::endl;
       workneeded += tmp_elems;
+      //std::cout << workneeded << std::endl;
     }
     int* d_bookmarks;
     gpuErrchk( cudaMalloc((void**)&d_bookmarks, (depth+1)*sizeof(int) ));
@@ -178,17 +168,40 @@ void arbitrary_scan( unsigned int * h_elements, int numElems){
     int filesize = numElems * sizeof(unsigned int);
 
     gpuErrchk( cudaMalloc((void**)&d_elements, worksize));
-    cudaDeviceSynchronize();
-
-    //copy memory host to device
+    gpuErrchk( cudaMemset(d_elements,0, worksize));
     gpuErrchk( cudaMemcpy( d_elements, h_elements, filesize , cudaMemcpyHostToDevice )); //change back to filesize@test
-    cudaDeviceSynchronize();
 
-    blelloch2_reduction<<<gridSize,blockSize,shareSize>>>( d_elements, d_bookmarks, numElems, 0 );
-    cudaDeviceSynchronize();
-
-    gpuErrchk( cudaMemcpy( h_elements, d_elements, filesize, cudaMemcpyDeviceToHost));
-    cudaDeviceSynchronize();
+    //blelloch2_reduction<<<gridSize,blockSize,shareSize>>>( d_elements, d_bookmarks, numElems, 0 );
+    //std::cout << depth << std::endl;
+    
+    
+    for(  int i = 0,
+              it_gridSz   = gridSize,
+              it_blockSz  = blockSize,
+              it_numElems = numElems,
+              it_shareSz  = shareSize
+          ; i <= depth ; i++ ){
+      //std::cout << h_bookmarks[i] << std::endl;
+      blelloch_threadsums<<<it_gridSz, it_blockSz, it_shareSz>>>( d_elements, d_bookmarks, it_numElems, i );
+      cudaDeviceSynchronize();
+      it_numElems = it_gridSz;
+      it_gridSz   = getGridSize (it_numElems);
+      it_blockSz  = getBlockSize(it_numElems);
+      it_shareSz  = 2*it_blockSz*sizeof(unsigned int);
+    }
+    //blelloch_threadsums<<<gridSize,blockSize,shareSize>>>(d_elements, d_bookmarks, numElems, 0)  ;
+    /*
+    for( int i = depth ; i >= 1 ; i--){
+      int it_numElems  = h_bookmarks[i] - h_bookmarks[i-1],
+          it_blockSz   = getBlockSize(it_numElems),
+          it_gridSz    = getGridSize (it_numElems);
+      blelloch_blocksum<<<it_gridSz,it_blockSz>>>(d_elements, d_bookmarks,it_numElems, i);
+      cudaDeviceSynchronize();
+    }*/
+    unsigned int* h_test_elements = (unsigned int*)malloc(worksize*sizeof(unsigned int));
+    gpuErrchk( cudaMemcpy( h_test_elements, d_elements, worksize, cudaMemcpyDeviceToHost)); //@test - used for checking memory in cuda-gdb.
+    gpuErrchk( cudaMemcpy( h_elements, d_elements, filesize, cudaMemcpyDeviceToHost)); 
+    std::cout << "moo";
 }
 
 

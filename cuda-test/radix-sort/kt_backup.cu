@@ -16,30 +16,15 @@
 #define INNERGRID gridDim.x/blockDim.x
 #define MAX_BLOCKSZ 512
 
-__device__ int d_getBlockSize(int numElems){
-  if(numElems > MAX_BLOCKSZ){
-    return MAX_BLOCKSZ;
-  }
-  else{
-    return numElems;
-  }
-}
-
-__device__ int d_getGridSize(int numElems){
-  return (numElems + MAX_BLOCKSZ -1)/MAX_BLOCKSZ;
-}
 
 __global__ void blelloch_blocksums( 
-  unsigned int* d_elements, 
-           int* d_bookmarks,
-            int blockSumNumElems,
-            int depth)
+  unsigned int* d_elements,
+            int blocks_mark, //blocks is the larger array
+            int sum_mark, //gets added to blocks
+            int blockSumNumElems)
 {
   int index = threadIdx.x + blockDim.x * blockIdx.x;
-  if( depth > 0 && 2*index+1 < blockSumNumElems){
-    int blocks_mark = d_bookmarks[depth-1];
-    int sum_mark = d_bookmarks[depth];
-    //d_elements[blocks_mark + index] = 0;
+  if( 2*index+1 < blockSumNumElems){
     d_elements[blocks_mark + 2*index] +=  d_elements[sum_mark + blockIdx.x];
     d_elements[blocks_mark + 2*index + 1 ] +=  d_elements[sum_mark + blockIdx.x];
   }
@@ -51,17 +36,15 @@ __global__ void blelloch_blocksums(
 }
 
 
-__global__ void blelloch2_reduction(
+__global__ void blelloch_threadscan(
   unsigned int* d_elements,
-           int* d_bookmarks,
-            int numElems,
-            int depth)
+            int bookmark,
+            int numElems
+)
 {
     extern __shared__ unsigned int shared[];
     int index = threadIdx.x + blockDim.x * blockIdx.x;
     int tid = threadIdx.x;
-    int bookmark = d_bookmarks[depth];
-    //int nextmark = d_bookmarks[depth+1];
 
     if( 2*index + 1 < numElems ){
       shared[2*tid] = d_elements[2*index + bookmark];
@@ -79,9 +62,11 @@ __global__ void blelloch2_reduction(
       }
       __syncthreads();
     }
+
+    //if gridDim is greater than one, store the block sum in the bookmarked section
+    //of global memory pointed to by d_elements.
     if(gridDim.x > 1){
-      int nextmark = d_bookmarks[depth+1];
-      d_elements[nextmark + blockIdx.x] = shared[MAXSHID2];
+      d_elements[bookmark + 1 + blockIdx.x] = shared[MAXSHID2];
     }
 
     if(tid == 0  ){
@@ -104,21 +89,6 @@ __global__ void blelloch2_reduction(
     }
     __syncthreads();
 
-    
-    if( index == 0 && gridDim.x > 1 ){
-      int innerblockdim = min(blockDim.x,gridDim.x); 
-      int innergriddim = (gridDim.x + blockDim.x -1)/blockDim.x;
-      blelloch2_reduction<<<innergriddim,innerblockdim>>>( d_elements, d_bookmarks , gridDim.x, depth+1 );
-    }
-    else if( index == 0 && gridDim.x == 1){
-      int bsum_numElems = d_bookmarks[depth] - d_bookmarks[depth-1];
-      int bsum_blockdim = d_getBlockSize(bsum_numElems);
-      int bsum_griddim = d_getGridSize(bsum_numElems);
-      int bsum_shared = 2*bsum_blockdim*sizeof(unsigned int);
-      blelloch_blocksums<<<bsum_griddim,bsum_blockdim,bsum_shared>>>(d_elements, d_bookmarks, bsum_numElems, depth);
-    }
-
-    
 }
 
 using namespace std;
@@ -134,7 +104,7 @@ inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=t
 }
 
 
-int getBlockSize(int numElems){
+inline int getBlockSize(int numElems){
   if(numElems > MAX_BLOCKSZ){
     return MAX_BLOCKSZ;
   }
@@ -143,49 +113,63 @@ int getBlockSize(int numElems){
   }
 }
 
-int getGridSize(int numElems){
+inline int getGridSize(int numElems){
   return (numElems + MAX_BLOCKSZ -1)/MAX_BLOCKSZ;
 }
 
 void arbitrary_scan( unsigned int * h_elements, int numElems){
     //allocate memory for device
     unsigned int * d_elements;
-    int gridSize = getGridSize(numElems/2);
+    int gridSize  = getGridSize(numElems/2);
     int blockSize = getBlockSize(numElems/2);
     int shareSize = 2*blockSize * sizeof(unsigned int);
 
-    //this section is used to set up starting conditions for the kernel
-    //as well as information for it to continue - eg the bookmarks are used
-    //by the kernel to find indexes for the blocksumming stages of the scan.
-    int bookmarks_sz =  128; //@note this is probably un-necessarily large, with a block size of 512, this will only be resizes if numElems ~= 512^128, which is huge.
-    vector<int> h_bookmarks(bookmarks_sz, 0); //@improve? 128 is arbitrarily selected, since the final size is unknown, and a resize every single loop is not preferable. Hence a resize every '32' is used.
+    //calculate array size(workneeded) and number of iterations(depth)
     int workneeded = numElems;
     int depth = 0;
+    int bookmarks_sz =  32; 
+    vector<int> h_bookmarks(bookmarks_sz, 0); //@improve? 128 is arbitrarily selected, since the final size is unknown, and a resize every single loop is not preferable. Hence a resize every '32' is used.
     for( int tmp_elems = gridSize ; tmp_elems > 1 ; tmp_elems = getGridSize(tmp_elems/blockSize) ) {
       depth++;
       if( depth >= bookmarks_sz ){ //if too deep, increase size to allow for more bookmark entries. 
         bookmarks_sz += 128;
         h_bookmarks.resize(bookmarks_sz); 
       }
-      h_bookmarks[depth] = workneeded; //note depth 0 case was not specifically handled by loop, but is set to 0 by initialisation of the vector, and is simply skipped by loop.
+      h_bookmarks[depth] = workneeded;
       workneeded += tmp_elems;
     }
-    int* d_bookmarks;
-    gpuErrchk( cudaMalloc((void**)&d_bookmarks, (depth+1)*sizeof(int) ));
-    gpuErrchk( cudaMemcpy(d_bookmarks, h_bookmarks.data(), (depth+1)*sizeof(int), cudaMemcpyHostToDevice ));
-
     int worksize = (workneeded+1) * sizeof(unsigned int); //plus 1 since sometimes the kernel will operate on an index 1 more than max without checking.
     int filesize = numElems * sizeof(unsigned int);
 
     gpuErrchk( cudaMalloc((void**)&d_elements, worksize));
-    cudaDeviceSynchronize();
-
-    //copy memory host to device
     gpuErrchk( cudaMemcpy( d_elements, h_elements, filesize , cudaMemcpyHostToDevice )); //change back to filesize@test
-    cudaDeviceSynchronize();
 
-    blelloch2_reduction<<<gridSize,blockSize,shareSize>>>( d_elements, d_bookmarks, numElems, 0 );
-    cudaDeviceSynchronize();
+    //blelloch2_reduction<<<gridSize,blockSize,shareSize>>>( d_elements, 0, numElems );
+
+    for( int i = 0,
+             bookmark    = 0,
+             it_gridSz   = gridSize,
+             it_blockSz  = blockSize,
+             it_numElems = numElems
+         ;i <= depth ; i++ ){
+      blelloch_threadscan<<<it_gridSz,it_blockSz,shareSize>>>( d_elements, bookmark, it_numElems );
+      cudaDeviceSynchronize();
+      bookmark   += it_numElems;
+      it_numElems = it_gridSz;
+      it_gridSz   = getGridSize (it_numElems);
+      it_blockSz  = getBlockSize(it_numElems);
+    }
+
+    /*
+    for( int i = depth ; i >= 0 ; i-- ){
+      int blocks_mark = h_bookmarks[i - 1];
+      int sum_mark = h_bookmarks[i];
+      int blockSumNumElems = sum_mark - blocks_mark;
+      int it_blockSz = getBlockSize(blockSumNumElems);
+      int it_gridSz = getGridSize(blockSumNumElems);
+      blelloch_blocksums<<<it_gridSz,it_blockSz>>>( d_elements, blocks_mark, sum_mark, blockSumNumElems);
+      cudaDeviceSynchronize();
+    }*/
 
     gpuErrchk( cudaMemcpy( h_elements, d_elements, filesize, cudaMemcpyDeviceToHost));
     cudaDeviceSynchronize();
