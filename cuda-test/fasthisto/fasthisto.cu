@@ -4,178 +4,102 @@
 #include <cuda_runtime.h> //used for assert
 #include <iostream>
 
-#include <vector>
 
 #include <fstream>
 #include <string>
 #include <climits>
 
-//backup version stored as kt_backup.cu
-#define MAX_BLOCKSZ 512
+#include <vector>
+#include <deque>
 
-__global__ void bookmark_blocksum(  
+#define MAX_BLOCKSZ 1024
 
-  unsigned int* d_elements,  
-            int blockSumNumElems, 
-            int nextmark
-)
-{
-  int index = threadIdx.x + blockDim.x * blockIdx.x;
-  if( 2*index+1 < blockSumNumElems){
-    //d_elements[blocks_mark + index] = 0;
-    d_elements[2*index] +=  d_elements[nextmark + blockIdx.x];
-    d_elements[2*index + 1] +=  d_elements[nextmark + blockIdx.x];
+
+__global__ void block_Reduce_dynamic( unsigned int * d_input, unsigned int * d_atomic_sync, int numElems ){ //Always create a copy of input and padd it with zeros
+  
+  int index =  threadIdx.x +  blockIdx.x * blockDim.x;
+
+  if( index <= numElems/2 ){
+    d_input[index] += d_input[index + numElems/2 + 1];
+    d_input[index + numElems/2 + 1] = 0;
   }
-  else{
-    //@todo throw some kind of error. consider using assert or something here instead.
+
+  if(threadIdx.x == 0){
+    atomicAdd(d_atomic_sync, 1);
+    if( d_atomic_sync[0] == gridDim.x && gridDim.x > 1 ){
+      d_atomic_sync[0] = 0;
+      int newGridDim = ((numElems/2+1) + MAX_BLOCKSZ - 1)/MAX_BLOCKSZ;
+      block_Reduce_dynamic<<< newGridDim, MAX_BLOCKSZ  >>> ( d_input, d_atomic_sync, numElems/2+1 );
+    }
   }
 }
 
+__global__ void block_Reduce( unsigned int * d_input, int totalBlocks ){ //Always create a copy of input and padd it with zeros
 
-__global__ void blelloch_threadsum(
-
-  unsigned int* d_elements, 
-            int numElems, 
-            int nextmark){
-    //@note @unexplained behavior, see blelloch-weirdbug.cu
-    extern __shared__ unsigned int shared[];
-    int index = threadIdx.x + blockDim.x * blockIdx.x;
-    int tid = threadIdx.x;
-
-    if( 2*index+1 < numElems  ){
-      shared[2*tid] = d_elements[2*index];
-      shared[2*tid+1] = d_elements[2*index + 1 ];
+  int index =  threadIdx.x +  blockIdx.x * blockDim.x;
+  if( blockIdx.x < totalBlocks){
+    d_input[index] += d_input[index + blockDim.x * gridDim.x ];
+    //d_input[index + blockDim.x * gridDim.x] = 0;
+  }
+  if(blockIdx.x == 0){
+    if( 2*gridDim.x < totalBlocks ){
+      d_input[threadIdx.x] += d_input[(totalBlocks-1) * blockDim.x + threadIdx.x ];
     }
-    __syncthreads();
+  }
 
-    int s = 1;
-    for( int d = blockDim.x ; d > 0  ; d >>= 1 ){
-      __syncthreads();
-      if( tid < d){ 
-        unsigned int addn = shared[s*(2*tid + 1) - 1];
-        unsigned int dest = shared[s*(2*tid + 2) - 1];
-        shared[s*(2*tid + 2) - 1] = dest + addn;
-      }
-      s *= 2;
-    }
+}
 
-    if(tid == 0  ){
-      d_elements[nextmark + blockIdx.x] = shared[2*blockDim.x - 1];
-      shared[2*blockDim.x - 1] = 0;
-    }
-
-    for( int d = 1 ; d < 2*blockDim.x ; d *= 2 ){
-      s >>= 1;
-      __syncthreads();
-      if(tid < d){
-        unsigned int addn = shared[s*(2*tid + 1) - 1];
-        unsigned int dest = shared[s*(2*tid + 2) - 1];
-        shared[s*(2*tid + 1) - 1] = dest;
-        shared[s*(2*tid + 2) - 1] = dest + addn;
-      }
-    }
-    __syncthreads();
+__global__ void thread_reduce( unsigned int * d_input ){
     
-    if( 2*index+1 < numElems  ){
-      d_elements[2*index] = shared[2*tid];
-      d_elements[2*index + 1] = shared[2*tid + 1];
+    extern __shared__ unsigned int shared[];
+    int index = threadIdx.x + blockIdx.x * blockDim.x;
+    int tid = threadIdx.x;
+    
+    shared[tid] = d_input[index];
+    __syncthreads();
+
+    for( int s = blockDim.x/2 ; s > 0 ; s >>= 1 ){
+      if( tid < s ){
+        shared[tid] += shared[tid+s];
+      }
+      __syncthreads();
+    }
+
+    if(tid == 0){
+        d_input[ 0 ] = shared[0];
     }
 }
 
-//only use this for the last block of an array.
-__global__ void hillisteel_tailsum(
-
-  unsigned int * const d_elements, 
-                   int numElems, 
-                   int nextmark
-)
-{
-
-  int tid = threadIdx.x;
-  extern __shared__ unsigned int shared[];
-
-  if(tid < numElems){
-    shared[tid] = d_elements[tid];
-  }
-  __syncthreads();
-
-  for( int s = 1 ; s < blockDim.x ; s <<= 1 ){
-    unsigned int val = 0;
-    int spot = tid - s;
-    if( spot >= 0 && tid < numElems ){
-      val = shared[spot];
-    }
-    __syncthreads();
-    if( spot >= 0 && tid < numElems ){
-      shared[tid] += val;
-    }
-    __syncthreads();
-  }
-  if( tid+1 < numElems ){
-    d_elements[tid+1] = shared[tid];
-  }
-  else if( tid == numElems-1){
-    //d_elements[nextmark] = shared[tid];
-    d_elements[0] = 0;
-  }
-
-}
 
 __global__ void radix_predicate( 
-  
-  unsigned int * const d_input,
-          bool * const d_predicate,  
-                   int current_bit,
-                   int size 
+
+  const unsigned int * const d_input,
+        unsigned int * const d_predicate,
+                         int binNumber,
+                         int numElems
 )
 {
   int index = threadIdx.x + blockDim.x*blockIdx.x;
-  if(index >= size ){ return; }
+  if(index >= numElems ){ return; } //@note early return is ok, because __syncthreads() was not used.
 
-  unsigned int x = d_input[index];
-  x >>= current_bit;
-  d_predicate[index] = x&1;
+  int input = (d_input[index]==binNumber);
+  d_predicate[index] = input;
 }
-
-__global__ void compact_relocate(
-
-  unsigned int * const d_values,
-  unsigned int * const d_newlocation,
-                bool * predicate,
-                   int totalNumElems,
-                   int newNumElems
-)
-{
-
-
-}
-
-
-/*
-__global__
-void yourHisto(const unsigned int* const vals, //INPUT
-               unsigned int* const histo, //OUPUT
-               int numVals)
-{
-  //TODO fill in this kernel to calculate the histogram
-  //as quickly as possible
-
-  //Although we provide only one kernel skeleton,
-  //feel free to use more if it will help you
-  //write faster code
-}*/
 
 
 using namespace std;
 
+
 #define gpuErrchk(ans) { gpuAssert((ans), __FILE__, __LINE__); } // copied from stack overflow, used to check gpuError codes while debugging.
 inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=true)
 {
+
    if (code != cudaSuccess) 
    {
     fprintf(stderr,"GPUassert: %s %s %d\n", cudaGetErrorString(code), file, line);
     if (abort) exit(code);
    }
+
 }
 
 
@@ -190,76 +114,6 @@ int getBlockSize(int numElems){
 
 int getGridSize(int numElems){
   return (numElems + MAX_BLOCKSZ -1)/MAX_BLOCKSZ;
-}
-
-unsigned int arbitrary_scan( unsigned int * h_elements, int numElems)
-{
-    //allocate memory for device
-    unsigned int * d_elements;
-    int shareSize = 2*MAX_BLOCKSZ * sizeof(unsigned int);
-
-    //this section is used to set up starting conditions for the kernel
-    //as well as information for it to continue - eg the bookmarks are used
-    //by the kernel to find indexes for the blocksumming stages of the scan.
-    int bookmarks_sz =  128; //@note this is probably un-necessarily large, with a block size of 512, this will only be resizes if numElems ~= 512^128, which is huge.
-    vector<int> h_bookmarks(bookmarks_sz, 0); //@improve? 128 is arbitrarily selected, since the final size is unknown, and a resize every single loop is not preferable. Hence a resize every '32' is used.
-    int workneeded = numElems;
-    int depth = 0;
-    int tmp_elems = (numElems+(MAX_BLOCKSZ*2) -1)/(MAX_BLOCKSZ*2);
-    while(tmp_elems > 1 ){
-      depth++;
-      if( depth+1 >= bookmarks_sz-1 ){ //if too deep, increase size to allow for more bookmark entries. 
-        bookmarks_sz += 128;
-        h_bookmarks.resize(bookmarks_sz); 
-      }
-      h_bookmarks[depth] = workneeded; //@note depth 0 case was not specifically handled by loop, but is set to 0 by initialisation of the vector, and is simply skipped by loop.
-      workneeded += tmp_elems;
-      tmp_elems = (tmp_elems+(MAX_BLOCKSZ*2) - 1)/(MAX_BLOCKSZ*2);
-    }
-    h_bookmarks[depth+1] = workneeded;
-
-    int worksize = (workneeded+1) * sizeof(unsigned int); //plus 1 since sometimes the kernel will operate on an index 1 more than max without checking.
-    int filesize = numElems * sizeof(unsigned int);
-
-    gpuErrchk( cudaMalloc((void**)&d_elements, worksize));
-    //gpuErrchk( cudaMemset( d_elements, 0, worksize));
-    gpuErrchk( cudaMemcpy( d_elements, h_elements, filesize , cudaMemcpyHostToDevice )); //change back to filesize@test
-    
-    unsigned int* h_test_elements = (unsigned int*)malloc(worksize*sizeof(unsigned int));//@test
-    for(  int i = 0,
-              it_numElems = numElems
-          ; i <= depth ; i++ )
-    {
-      
-      //Set up initial conditions
-      int it_remSz  = it_numElems%(2*MAX_BLOCKSZ),
-          it_gridSz = it_numElems/(2*MAX_BLOCKSZ),
-          remMark   = h_bookmarks[i+1] - it_remSz,
-          nextmark  = h_bookmarks[i+1] - h_bookmarks[i];
-      //run the relevant kernel if conditions are correct
-      if( it_gridSz ){ blelloch_threadsum<<<it_gridSz, MAX_BLOCKSZ, shareSize>>>( d_elements + h_bookmarks[i] , it_numElems, nextmark ); }
-      if( it_remSz  ){ hillisteel_tailsum<<<1, it_remSz,shareSize>>>( d_elements + remMark, it_remSz, nextmark + it_gridSz ); }
-      cudaDeviceSynchronize();
-
-      //increment the elements in loop
-      it_numElems = it_gridSz + (it_remSz >= 1) ;
-      it_gridSz   = it_numElems;
-    }
-    
-    for( int i = depth ; i > 0 ; i--){
-      int it_numElems  = h_bookmarks[i] - h_bookmarks[i-1],
-          it_blockSz   = getBlockSize(it_numElems),
-          it_gridSz    = getGridSize (it_numElems),
-          nextmark     = h_bookmarks[i] - h_bookmarks[i-1];
-      bookmark_blocksum<<<it_gridSz,it_blockSz>>>(d_elements + h_bookmarks[i-1], it_numElems, nextmark);
-      cudaDeviceSynchronize();
-    }
-    unsigned int last = h_elements[numElems - 1];
-    gpuErrchk( cudaMemcpy( &last, d_elements , sizeof(unsigned int), cudaMemcpyDeviceToHost ))
-    gpuErrchk( cudaMemcpy( h_elements, d_elements, filesize, cudaMemcpyDeviceToHost));
-    unsigned int reduced = last + h_elements[numElems - 1];
-
-    return reduced;
 }
 
 
@@ -277,16 +131,54 @@ void computeHistogram(const unsigned int* const d_vals, //INPUT
   //delete[] h_vals;
   //delete[] h_histo;
   //delete[] your_histo;
-  unsigned int * h_histo = (unsigned int*) malloc( numBins * sizeof(unsigned int));//histogram is probably better held on a latency optimised system.
+  //unsigned int * h_histo = (unsigned int*) malloc( numBins * sizeof(unsigned int));//histogram is probably better held on a latency optimised system.
 
 
-  for( int shift = 1 ; (numBins >> shift) > 0 ; shift++ ){
+
+  int gridSize  = getGridSize ( numElems );
+  int blockSize = getBlockSize( numElems );
+  int filesize  = 1 + gridSize * MAX_BLOCKSZ * sizeof(unsigned int); //+1 space is used as a single global memory location for atomic operations add +1 to get actual pointer
+  vector<unsigned int> h_histo( numBins, 0 );
+  int total = 0;
+  unsigned int * d_predicate ;
+  gpuErrchk( cudaMalloc( (void**)&d_predicate , filesize ) );
+
+  for( int binNumber = 0; binNumber < numBins ; binNumber++ ){
+    gpuErrchk( cudaMemset( d_predicate, 0, filesize));
+    radix_predicate<<<gridSize,blockSize>>>( d_vals, d_predicate+1, binNumber, numElems);
     
-  }
+    /*if( numElems > MAX_BLOCKSZ ){
+      block_Reduce_dynamic<<<gridSize/2+1, MAX_BLOCKSZ >>>( d_predicate+1, d_predicate, numElems );
+    }*/
+    cudaDeviceSynchronize();
+    for( int blocksRemaining = gridSize/2,
+             previous        = gridSize;
+         blocksRemaining > 0;
+         previous        = blocksRemaining,
+         blocksRemaining >>= 1
+        )
+    {
+      block_Reduce<<<blocksRemaining,MAX_BLOCKSZ>>>( d_predicate+1, previous);
+      cudaDeviceSynchronize();
+    }
 
+    //cudaDeviceSynchronize();
+    //unsigned int * h_debug = (unsigned int*) malloc( filesize );
+    //cudaMemcpy( h_debug, d_predicate+1, filesize, cudaMemcpyDeviceToHost);
+    thread_reduce <<<1,MAX_BLOCKSZ, MAX_BLOCKSZ * sizeof(unsigned int)>>>( d_predicate+1 );
+    cudaMemcpy( h_histo.data()+binNumber, d_predicate+1, sizeof(unsigned int), cudaMemcpyDeviceToHost);
+    cout  << "bin#" << binNumber << ": " << h_histo[binNumber] << endl;
+    total += h_histo[binNumber];
+    //h_histo[binNumber] = arbitrary_reduce( d_predicate, numElems);
+    //cout << scanned_predicate << endl;
+    //cudaDeviceSynchronize();
+
+  }
+  cudaMemcpy( d_histo, h_histo.data(), numBins * sizeof(unsigned int) , cudaMemcpyHostToDevice );
+  cout << "total: " << total << endl;
+  cudaFree(d_predicate);
 }
 
-using namespace std;
 
 //test section
 int main(int argc, char * argv[]){
@@ -325,17 +217,13 @@ int main(int argc, char * argv[]){
     unsigned int binsize = NUMBINS * sizeof(unsigned int);
     unsigned int * h_histo = (unsigned int *)malloc(binsize);
 
-
-
-
     gpuErrchk( cudaMalloc((void**)&d_values, filesize ));
     gpuErrchk( cudaMalloc((void**)&d_histo, NUMBINS*sizeof(unsigned int) ));
 
     gpuErrchk( cudaMemcpy( d_values, h_values, filesize, cudaMemcpyHostToDevice ) );
-    computeHistogram( d_values, d_histo, NUMBINS, numElems );
 
+    computeHistogram( d_values, d_histo, NUMBINS, numElems );  
     gpuErrchk( cudaMemcpy( h_histo, d_histo, binsize, cudaMemcpyDeviceToHost ));
 
   }
-
 }

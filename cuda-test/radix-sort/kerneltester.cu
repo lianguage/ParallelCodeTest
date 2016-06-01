@@ -122,21 +122,25 @@ using namespace std;
 #define gpuErrchk(ans) { gpuAssert((ans), __FILE__, __LINE__); } // copied from stack overflow, used to check gpuError codes while debugging.
 inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=true)
 {
+
    if (code != cudaSuccess) 
    {
     fprintf(stderr,"GPUassert: %s %s %d\n", cudaGetErrorString(code), file, line);
     if (abort) exit(code);
    }
+
 }
 
 
 int getBlockSize(int numElems){
+
   if(numElems > MAX_BLOCKSZ){
     return MAX_BLOCKSZ;
   }
   else{
     return numElems;
   }
+
 }
 
 int getGridSize(int numElems){
@@ -208,6 +212,7 @@ void arbitrary_scan( unsigned int * h_elements, int numElems){
     }
     gpuErrchk( cudaMemcpy( h_test_elements, d_elements, worksize, cudaMemcpyDeviceToHost)); //@test - used for checking memory in cuda-gdb.
     gpuErrchk( cudaMemcpy( h_elements, d_elements, filesize, cudaMemcpyDeviceToHost)); 
+    
 }
 
 

@@ -171,6 +171,7 @@ void arbitrary_scan( unsigned int * h_elements, int numElems){
     int worksize = (workneeded+1) * sizeof(unsigned int); //plus 1 since sometimes the kernel will operate on an index 1 more than max without checking.
     int filesize = numElems * sizeof(unsigned int);
 
+    unsigned int * d_elements;
     gpuErrchk( cudaMalloc((void**)&d_elements, worksize));
     //gpuErrchk( cudaMemset( d_elements, 0, worksize));
     gpuErrchk( cudaMemcpy( d_elements, h_elements, filesize , cudaMemcpyHostToDevice )); //change back to filesize@test

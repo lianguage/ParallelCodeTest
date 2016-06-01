@@ -74,21 +74,6 @@ __global__ void max_reduce(   unsigned int* const d_position,
 }
 
 
-__global__ void radix_predicate(   unsigned int * const d_input,
-                                   //unsigned int* const d_position,
-                                   unsigned int * const d_predicate,
-                                   int current_bit,
-                                   int size
-                                   ){
-   
-	int index = threadIdx.x + blockDim.x*blockIdx.x;
-	if(index >= size ){ return; }
-
-	unsigned int x = d_input[index];
-	x >>= current_bit;
-	d_predicate[index] = x&1;
-}
-
 
 __global__ void blelloch1_reduction_scan( unsigned int * const d_elements,
 							   			  int numElems
@@ -118,6 +103,21 @@ __global__ void blelloch1_reduction_scan( unsigned int * const d_elements,
 
 }
 
+
+__global__ void radix_predicate(   unsigned int * const d_input,
+                                   //unsigned int* const d_position,
+                                   unsigned int * const d_predicate,
+                                   int current_bit,
+                                   int size
+                                   ){
+   
+	int index = threadIdx.x + blockDim.x*blockIdx.x;
+	if(index >= size ){ return; }
+
+	unsigned int x = d_input[index];
+	x >>= current_bit;
+	d_predicate[index] = x&1;
+}
 
 
 __global__ void scan_inplace_threads(
